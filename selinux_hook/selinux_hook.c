@@ -21,12 +21,11 @@
 #include <security.h>
 #include <ksyms.h>
 #include <hook.h>
-#include <hotpatch.h>
 #include <kpmodule.h>
 #include <kputils.h>
 
 KPM_NAME("selinux_magisk_access_filter");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.1.2");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
@@ -55,13 +54,6 @@ KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
 static void *g_funcs[16];
 static int g_hooks;
 struct file;
-typedef ssize_t (*sel_write_op_fn)(struct file *file, char *buf, size_t size);
-static sel_write_op_fn *g_write_op_access_slot;
-static sel_write_op_fn *g_write_op_context_slot;
-static sel_write_op_fn g_orig_write_op_access;
-static sel_write_op_fn g_orig_write_op_context;
-static bool g_write_op_access_patched;
-static bool g_write_op_context_patched;
 static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
 static long (*copy_to_user_nofault_fn)(void __user *dst, const void *src, size_t size);
 static unsigned long (*copy_to_user_raw_fn)(void __user *dst, const void *src, unsigned long size);
@@ -431,6 +423,7 @@ static u32 g_procattr_current_count;
 static u32 g_setprocattr_probe_count;
 static u32 g_selinux_setprocattr_probe_count;
 static bool g_clean_policydb_av_disabled;
+static bool g_policydb_offset_fallback_warned;
 static u32 g_status_read_count;
 static u32 g_status_probe_count;
 static u32 g_status_redirect_count;
@@ -474,6 +467,8 @@ static raw_spinlock_t g_scopes_lock = { .raw_lock = ATOMIC_INIT(0) };
 
 static bool contains_magisk(const char *s, size_t len);
 static bool contains_case_lit(const char *s, size_t len, const char *lit, size_t lit_len);
+static bool dirtysepolicy_context_should_hide(const char *query);
+static bool dirtysepolicy_access_should_deny(const char *query, size_t len);
 static bool clean_context_exists(const char *query);
 static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query);
 static bool legacy_should_block_access_query(const char *query, size_t len);
@@ -489,9 +484,12 @@ static bool use_clean_blob_route(void);
 static bool use_legacy_clean_blob_query(void);
 static bool clean_policydb_redirect_supported(void);
 static bool selinux_compat_call_needed(void);
+static bool policydb_offset_fallback_allowed(void);
+static bool write_op_slot_fallback_allowed(void);
 static bool security_setprocattr_has_lsm_arg(void);
-static void append_u32_dec(char *buf, size_t size, u32 value);
-static unsigned long lookup_name_with_suffix(const char *base);
+static void resolve_required_symbols_once(void);
+static void *lookup_name_optional_suffix(const char *base);
+static void log_symbol_addr(const char *name, const void *addr);
 static void zero_bytes(void *dst, size_t len);
 static int call_security_read_policy(void **data, size_t *len);
 static int call_security_load_policy(void *data, size_t len, struct selinux_load_state *load_state);
@@ -524,8 +522,6 @@ static bool current_status_read_scope_patched(void);
 static bool enter_clean_eval_scope(void);
 static void leave_clean_eval_scope(void);
 static bool current_in_clean_eval_scope(void);
-static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size);
-static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size);
 static int install_write_op_hooks(void);
 static void uninstall_write_op_hooks(void);
 static void uninstall_inline_hooks(void);
@@ -759,14 +755,30 @@ static bool use_legacy_clean_blob_query(void)
 static bool clean_policydb_redirect_supported(void)
 {
     /*
-     * Android 4.14 can reach security_compute_av() from sel_write_context()
-     * through a legacy context_struct_compute_av() signature which has no
-     * policydb argument.  Keep the policydb-argument redirect path limited to
-     * kernels where arg0 is really a policydb pointer.
+     * 4.14 reference basis:
+     *   - https://github.com/balgxmr/kernel_xiaomi_cepheus/tree/sixteen
+     *   - https://github.com/LineageOS/android_kernel_xiaomi_sm8150/tree/lineage-22.2
+     *   - https://android.googlesource.com/kernel/common/+/refs/heads/deprecated/android-4.14-stable
      *
-     * 部分 4.14 内核 BACKPORT 了以下 commit：
-     * https://android.googlesource.com/kernel/common/+/aa8e712cee93d520e96a2ca8e3a20f807c937e3f
-     * selinux_state 和 policydb 参数均是在该 commit 中引入的。
+     * Relevant source paths:
+     *   - security/selinux/ss/services.c
+     *       context_struct_compute_av(struct policydb *policydb, ...)
+     *       security_read_policy(struct selinux_state *state, ...)
+     *       security_context_to_sid(struct selinux_state *state, ...)
+     *       security_load_policy(struct selinux_state *state, ...)
+     *   - security/selinux/selinuxfs.c
+     *       sel_write_access(), sel_write_context(), write_op[]
+     *
+     * 这里的 4.14 适配不是单纯按 kver 猜 ABI，而是用上述 cepheus/sm8150
+     * 4.14 源码确认 SELinux helper 的真实签名。只要运行时能解析到
+     * selinux_state，就认为它符合这组 4.14 stateful SELinux 布局；否则
+     * 回退到更保守的 legacy 路径，避免把 policydb 参数强套到未知布局上。
+     *
+     * The Xiaomi sm8150/cepheus 4.14 lineage keeps selinux_state and also uses
+     * the policydb-argument context_struct_compute_av() signature.  Therefore
+     * selinux_state is the runtime confidence signal for using the 4.14
+     * stateful SELinux helper signatures and the 6-argument policydb redirect
+     * path.  Kernels older than this baseline stay on the pure legacy route.
      */
     return !use_legacy_clean_blob_query() || g_selinux_state;
 }
@@ -810,50 +822,152 @@ static void log_bypass_once(const char *node, uid_t uid, const char *query)
 
 static bool selinux_compat_call_needed(void)
 {
+    /*
+     * 4.14 参考源码里的 security_read_policy() / security_context_to_sid()
+     * 都需要 struct selinux_state * 作为第一个参数。这里用 selinux_state
+     * 作为运行时信号，避免在没有 stateful ABI 的旧内核上误传参数。
+     *
+     * security_read_policy() and security_context_to_sid() are stateful on the
+     * 4.14 sources listed above.  Keep the state argument through the Android
+     * common stateful era, and stop before the newer 6.4+ LSM refactors where
+     * this KPM has not been audited.
+     */
     return g_selinux_state && kver >= VERSION(4, 14, 0) && kver < VERSION(6, 4, 0);
+}
+
+static bool policydb_offset_fallback_allowed(void)
+{
+    /*
+     * policydb 偏移不能靠 sizeof(void *) 盲猜。只有确认当前内核像已审计的
+     * 4.14 sm8150/cepheus stateful 布局，或者已经是非 legacy 的新内核时，
+     * 才允许这个兜底；否则宁可跳过高风险路径。
+     *
+     * Do not guess policydb layout on pre-baseline legacy kernels.  The old
+     * sizeof(void *) fallback is only acceptable once the runtime looks like
+     * the audited 4.14 sm8150/cepheus stateful SELinux layout or a newer
+     * non-legacy kernel.
+     */
+    return !use_legacy_clean_blob_query() || g_selinux_state;
+}
+
+static bool write_op_slot_fallback_allowed(void)
+{
+    /*
+     * 参考 4.14 selinuxfs.c 可以确认 write_op[] 的 access/context 下标，
+     * 但“下标可信”和“可以安全写函数指针表”是两回事。当前 APatch/KP c02
+     * 不导出 hotpatch_nosync，所以实际写表逻辑在 install_write_op_hooks()
+     * 里禁用，只保留这个布局置信度判断和日志。
+     *
+     * SEL_CONTEXT == 5 and SEL_ACCESS == 6 are confirmed in
+     * security/selinux/selinuxfs.c for the referenced 4.14 trees.  This gate
+     * only expresses layout confidence; the actual pointer-table patch is
+     * disabled below on APatch/KP c02 because hotpatch_nosync is not exported.
+     */
+    return !use_legacy_clean_blob_query() || g_selinux_state;
 }
 
 static bool security_setprocattr_has_lsm_arg(void)
 {
+    /*
+     * security/security.c:
+     *   < 5.4  security_setprocattr(name, value, size)
+     *   >=5.4  security_setprocattr(lsm, name, value, size)
+     */
     return kver >= VERSION(5, 4, 0);
 }
 
 static bool security_load_policy_has_load_state(void)
 {
+    /*
+     * 4.14 的 security_load_policy() 会直接提交 live policy，没有新版
+     * load_state/cancel 流程。只有解析到 selinux_policy_cancel 这类新版
+     * 辅助符号时，才走带 load_state 的调用；否则使用 clean blob /
+     * policydb_read 路线。
+     *
+     * The referenced 4.14 services.c commits the loaded policy directly:
+     *   security_load_policy(struct selinux_state *state, void *data, size_t len)
+     *
+     * Newer kernels grow staged load-state/cancel helpers.  Use the presence of
+     * selinux_policy_cancel()/compat as the runtime signal before calling the
+     * load_state form; otherwise fall back to clean blob / policydb_read.
+     */
     return selinux_policy_cancel_fn || selinux_policy_cancel_compat_fn;
 }
 
-static void append_u32_dec(char *buf, size_t size, u32 value)
-{
-    char tmp[10];
-    size_t pos = 0;
-    size_t i = 0;
-
-    if (!buf || !size)
-        return;
-
-    while (pos < size && buf[pos])
-        pos++;
-    if (pos >= size - 1)
-        return;
-
-    do {
-        tmp[i++] = (char)('0' + (value % 10));
-        value /= 10;
-    } while (value && i < sizeof(tmp));
-
-    while (i && pos < size - 1)
-        buf[pos++] = tmp[--i];
-    buf[pos] = '\0';
-}
-
-struct suffix_lookup {
+struct symbol_cache_entry {
     const char *base;
+    size_t len;
     unsigned long addr;
+    bool exact;
+    bool suffixed;
 };
 
 typedef int (*kallsyms_on_each_symbol_nomod_fn)(int (*fn)(void *, const char *, unsigned long),
                                                 void *data);
+
+#define SYMBOL_CACHE_ENTRY(name) { name, 0, 0, false, false }
+
+static struct symbol_cache_entry g_symbol_cache[] = {
+    SYMBOL_CACHE_ENTRY("_raw_spin_lock"),
+    SYMBOL_CACHE_ENTRY("_raw_spin_unlock"),
+    SYMBOL_CACHE_ENTRY("copy_from_kernel_nofault"),
+    SYMBOL_CACHE_ENTRY("probe_kernel_read"),
+    SYMBOL_CACHE_ENTRY("copy_to_user_nofault"),
+    SYMBOL_CACHE_ENTRY("_copy_to_user"),
+    SYMBOL_CACHE_ENTRY("__copy_to_user"),
+    SYMBOL_CACHE_ENTRY("vmalloc"),
+    SYMBOL_CACHE_ENTRY("vmalloc_noprof"),
+    SYMBOL_CACHE_ENTRY("vfree"),
+    SYMBOL_CACHE_ENTRY("init_task"),
+    SYMBOL_CACHE_ENTRY("filp_open"),
+    SYMBOL_CACHE_ENTRY("filp_close"),
+    SYMBOL_CACHE_ENTRY("kernel_read"),
+    SYMBOL_CACHE_ENTRY("vfs_llseek"),
+    SYMBOL_CACHE_ENTRY("selinux_state"),
+    SYMBOL_CACHE_ENTRY("security_load_policy"),
+    SYMBOL_CACHE_ENTRY("security_context_to_sid"),
+    SYMBOL_CACHE_ENTRY("policydb_read"),
+    SYMBOL_CACHE_ENTRY("policydb_destroy"),
+    SYMBOL_CACHE_ENTRY("flex_array_get"),
+    SYMBOL_CACHE_ENTRY("avtab_search_node"),
+    SYMBOL_CACHE_ENTRY("avtab_search_node_next"),
+    SYMBOL_CACHE_ENTRY("cond_compute_av"),
+    SYMBOL_CACHE_ENTRY("constraint_expr_eval"),
+    SYMBOL_CACHE_ENTRY("type_attribute_bounds_av"),
+    SYMBOL_CACHE_ENTRY("selinux_policy_cancel"),
+    SYMBOL_CACHE_ENTRY("sidtab_cancel_convert"),
+    SYMBOL_CACHE_ENTRY("security_read_policy"),
+    SYMBOL_CACHE_ENTRY("simple_read_from_buffer"),
+    SYMBOL_CACHE_ENTRY("sel_read_handle_status"),
+    SYMBOL_CACHE_ENTRY("sel_mmap_handle_status"),
+    SYMBOL_CACHE_ENTRY("selinux_status_update_seqlock"),
+    SYMBOL_CACHE_ENTRY("selinux_status_update_policyload"),
+    SYMBOL_CACHE_ENTRY("security_setprocattr"),
+    SYMBOL_CACHE_ENTRY("selinux_setprocattr"),
+    SYMBOL_CACHE_ENTRY("sel_write_access"),
+    SYMBOL_CACHE_ENTRY("sel_write_context"),
+    SYMBOL_CACHE_ENTRY("write_op"),
+    SYMBOL_CACHE_ENTRY("context_struct_compute_av"),
+    SYMBOL_CACHE_ENTRY("string_to_context_struct"),
+    SYMBOL_CACHE_ENTRY("selinux_complete_init"),
+    SYMBOL_CACHE_ENTRY("selinux_policy_commit"),
+};
+
+#define SYMBOL_CACHE_COUNT (sizeof(g_symbol_cache) / sizeof(g_symbol_cache[0]))
+
+static bool g_symbol_cache_resolved;
+
+static size_t str_len_safe(const char *s)
+{
+    size_t len = 0;
+
+    if (!s)
+        return 0;
+
+    while (s[len])
+        len++;
+    return len;
+}
 
 static bool suffix_contains_cfi(const char *suffix)
 {
@@ -871,112 +985,179 @@ static bool suffix_contains_cfi(const char *suffix)
     return false;
 }
 
-static bool symbol_has_compiler_suffix(const char *name, const char *base)
+static bool symbol_name_matches(const char *name, const char *base, size_t len)
 {
     size_t i;
 
     if (!name || !base)
         return false;
 
-    for (i = 0; base[i]; i++) {
+    for (i = 0; i < len; i++) {
         if (name[i] != base[i])
             return false;
     }
 
-    if (!(name[i] == '.' || name[i] == '$') || !name[i + 1])
+    return name[len] == '\0';
+}
+
+static bool symbol_has_compiler_suffix(const char *name, const char *base, size_t len)
+{
+    size_t i;
+
+    if (!name || !base || !len)
+        return false;
+
+    for (i = 0; i < len; i++) {
+        if (name[i] != base[i])
+            return false;
+    }
+
+    if (!(name[len] == '.' || name[len] == '$') || !name[len + 1])
         return false;
 
     /* Skip CFI stub variants; they redirect to the real function */
-    if (suffix_contains_cfi(name + i + 1))
+    if (suffix_contains_cfi(name + len + 1))
         return false;
 
     return true;
 }
 
-static int lookup_name_with_suffix_cb(void *data, const char *name,
-                                      struct module *module, unsigned long addr)
+static void prepare_symbol_cache(void)
 {
-    struct suffix_lookup *lookup = data;
+    size_t i;
 
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++)
+        g_symbol_cache[i].len = str_len_safe(g_symbol_cache[i].base);
+}
+
+static void cache_symbol_match(const char *name, unsigned long addr)
+{
+    size_t i;
+
+    if (!name || !addr)
+        return;
+
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        struct symbol_cache_entry *entry = &g_symbol_cache[i];
+
+        if (!entry->base || !entry->len || entry->exact)
+            continue;
+
+        if (symbol_name_matches(name, entry->base, entry->len)) {
+            entry->addr = addr;
+            entry->exact = true;
+            entry->suffixed = false;
+            continue;
+        }
+
+        if (!entry->addr &&
+            symbol_has_compiler_suffix(name, entry->base, entry->len)) {
+            entry->addr = addr;
+            entry->suffixed = true;
+        }
+    }
+}
+
+static int cache_symbol_cb(void *data, const char *name,
+                           struct module *module, unsigned long addr)
+{
+    (void)data;
     (void)module;
-    if (!lookup || lookup->addr || !addr)
-        return 0;
 
-    if (!symbol_has_compiler_suffix(name, lookup->base))
-        return 0;
-
-    lookup->addr = addr;
-    selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                     lookup->base, name, addr);
-    return 1;
+    cache_symbol_match(name, addr);
+    return 0;
 }
 
-static int lookup_name_with_suffix_cb_nomod(void *data, const char *name,
-                                            unsigned long addr)
+static int cache_symbol_cb_nomod(void *data, const char *name, unsigned long addr)
 {
-    struct suffix_lookup *lookup = data;
+    (void)data;
 
-    if (!lookup || lookup->addr || !addr)
-        return 0;
-
-    if (!symbol_has_compiler_suffix(name, lookup->base))
-        return 0;
-
-    lookup->addr = addr;
-    selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                     lookup->base, name, addr);
-    return 1;
+    cache_symbol_match(name, addr);
+    return 0;
 }
 
-static unsigned long lookup_suffix_by_symbol_walk(const char *base)
+static void resolve_required_symbols_once(void)
 {
-    struct suffix_lookup lookup;
+    size_t i;
+    u32 found = 0;
+    u32 suffixed = 0;
+    u32 missing = 0;
 
-    if (!kallsyms_on_each_symbol)
-        return 0;
+    if (READ_ONCE(g_symbol_cache_resolved))
+        return;
 
-    lookup.base = base;
-    lookup.addr = 0;
+    prepare_symbol_cache();
 
-    if (kver <= VERSION(6, 1, 0)) {
-        kallsyms_on_each_symbol(lookup_name_with_suffix_cb, &lookup);
+    if (!kallsyms_on_each_symbol) {
+        pr_warn("[selinux_hook] kallsyms_on_each_symbol missing; falling back to exact symbol lookups only\n");
+        for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+            unsigned long addr;
+
+            addr = (unsigned long)kallsyms_lookup_name(g_symbol_cache[i].base);
+            if (addr) {
+                g_symbol_cache[i].addr = addr;
+                g_symbol_cache[i].exact = true;
+            }
+        }
+    } else if (kver <= VERSION(6, 1, 0)) {
+        kallsyms_on_each_symbol(cache_symbol_cb, NULL);
     } else {
         kallsyms_on_each_symbol_nomod_fn on_each_symbol;
 
         on_each_symbol = (kallsyms_on_each_symbol_nomod_fn)kallsyms_on_each_symbol;
-        on_each_symbol(lookup_name_with_suffix_cb_nomod, &lookup);
+        on_each_symbol(cache_symbol_cb_nomod, NULL);
     }
 
-    return lookup.addr;
-}
-
-static unsigned long lookup_name_with_suffix(const char *base)
-{
-    char name[96];
-    size_t i;
-    u32 n;
-    unsigned long addr;
-
-    if (!base)
-        return 0;
-
-    for (n = 0; n < 256; n++) {
-        for (i = 0; i < sizeof(name) - 1 && base[i]; i++)
-            name[i] = base[i];
-        if (i >= sizeof(name) - 2)
-            return 0;
-        name[i++] = '.';
-        name[i] = '\0';
-        append_u32_dec(name, sizeof(name), n);
-        addr = (unsigned long)kallsyms_lookup_name(name);
-        if (addr) {
-            selinux_hook_dbg("[selinux_hook] resolved %s as %s @ %lx\n",
-                             base, name, addr);
-            return addr;
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        if (g_symbol_cache[i].addr) {
+            found++;
+            if (g_symbol_cache[i].suffixed)
+                suffixed++;
+        } else {
+            missing++;
         }
     }
 
-    return lookup_suffix_by_symbol_walk(base);
+    WRITE_ONCE(g_symbol_cache_resolved, true);
+    pr_info("[selinux_hook] symbol cache resolved in one pass: found=%u suffixed=%u missing=%u\n",
+            found, suffixed, missing);
+}
+
+static struct symbol_cache_entry *find_cached_symbol(const char *base)
+{
+    size_t i;
+
+    if (!base)
+        return NULL;
+
+    for (i = 0; i < SYMBOL_CACHE_COUNT; i++) {
+        if (str_eq_lit(base, g_symbol_cache[i].base))
+            return &g_symbol_cache[i];
+    }
+
+    return NULL;
+}
+
+static void *lookup_name_optional_suffix(const char *base)
+{
+    struct symbol_cache_entry *entry;
+
+    if (!base)
+        return NULL;
+
+    resolve_required_symbols_once();
+
+    entry = find_cached_symbol(base);
+    if (entry)
+        return (void *)entry->addr;
+
+    return (void *)kallsyms_lookup_name(base);
+}
+
+static void log_symbol_addr(const char *name, const void *addr)
+{
+    pr_info("[selinux_hook] symbol %-36s %s addr=%px\n",
+            name ?: "(null)", addr ? "found" : "missing", addr);
 }
 
 static int call_security_read_policy(void **data, size_t *len)
@@ -1411,6 +1592,15 @@ static void refresh_policydb_offset(const char *reason, bool allow_fallback)
     if (!allow_fallback)
         return;
 
+    if (!policydb_offset_fallback_allowed()) {
+        if (!READ_ONCE(g_policydb_offset_fallback_warned)) {
+            WRITE_ONCE(g_policydb_offset_fallback_warned, true);
+            pr_warn("[selinux_hook] policydb offset fallback refused reason=%s kver=%x policy=%px policydb=%px: legacy route lacks 4.14 selinux_state baseline\n",
+                    reason ?: "(null)", kver, policy, policydb);
+        }
+        return;
+    }
+
     WRITE_ONCE(g_policydb_offset, (size_t)SELINUX_POLICYDB_FALLBACK_OFFSET);
     selinux_hook_dbg("[selinux_hook] policydb offset fallback reason=%s policy=%px policydb=%px off=%zu\n",
                      reason ?: "(null)", policy, policydb, READ_ONCE(g_policydb_offset));
@@ -1736,6 +1926,79 @@ static bool clean_context_exists(const char *query)
     return clean_context_token_exists(query, token_len(query));
 }
 
+static bool token_eq_lit(const char *token, size_t len, const char *lit)
+{
+    size_t i;
+
+    if (!token || !lit)
+        return false;
+
+    for (i = 0; i < len; i++) {
+        if (!lit[i] || !ascii_lower_eq(token[i], lit[i]))
+            return false;
+    }
+
+    return lit[i] == '\0';
+}
+
+static bool context_token_matches(const char *query, const char *lit)
+{
+    const char *ctx = skip_spaces(query);
+
+    return token_eq_lit(ctx, token_len(ctx), lit);
+}
+
+static bool dirtysepolicy_context_should_hide(const char *query)
+{
+    /*
+     * DirtySepolicy reference:
+     *   https://github.com/LSPosed/DirtySepolicy/tree/0cda3b89cd168c88cbf639da9e3d4f44d70c0b78
+     *
+     * Relevant source paths:
+     *   - app/src/main/java/org/lsposed/dirtysepolicy/AppZygote.java
+     *       contextExists("u:r:adbroot:s0")
+     *       contextExists("u:r:magisk:s0")
+     *       contextExists("u:object_r:magisk_file:s0")
+     *       contextExists("u:r:ksu:s0")
+     *       contextExists("u:object_r:ksu_file:s0")
+     *       contextExists("u:object_r:lsposed_file:s0")
+     *       contextExists("u:object_r:xposed_data:s0")
+     *       contextExists("u:object_r:xposed_file:s0")
+     *   - app/src/main/java/org/lsposed/dirtysepolicy/SELinux.java
+     *       contextExists() first writes /sys/fs/selinux/context.
+     *       On EINVAL it falls back to /sys/fs/selinux/access.
+     *       On EINVAL again it writes /proc/self/attr/current; EPERM is still
+     *       interpreted as "context exists".
+     *
+     * DirtySepolicy 的 contextExists() 不是只测 /sys/fs/selinux/context。
+     * 如果这里只拦 context 节点，它还会继续走 access fallback，最后再写
+     * /proc/self/attr/current；其中 EPERM 也会被它当成“上下文存在”。因此
+     * 这些敏感 context 必须在三条路径里都表现成 EINVAL/不存在。
+     *
+     * Because of that three-stage fallback, hiding a dirty context requires all
+     * three kernel paths to return an "invalid context" style result for
+     * app-side probes.
+     */
+    if (context_token_matches(query, "u:r:adbroot:s0"))
+        return true;
+    if (context_token_matches(query, "u:r:magisk:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:magisk_file:s0"))
+        return true;
+    if (context_token_matches(query, "u:r:ksu:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:ksu_file:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:lsposed_file:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:xposed_data:s0"))
+        return true;
+    if (context_token_matches(query, "u:object_r:xposed_file:s0"))
+        return true;
+
+    return false;
+}
+
 static const char *next_token(const char *s)
 {
     s = skip_spaces(s);
@@ -1764,8 +2027,89 @@ static bool clean_access_contexts_exist(const char *query)
     return true;
 }
 
+static bool access_contexts_match(const char *query, const char *src_lit,
+                                  const char *dst_lit)
+{
+    const char *src;
+    const char *dst;
+
+    src = skip_spaces(query);
+    dst = next_token(src);
+
+    return token_eq_lit(src, token_len(src), src_lit) &&
+           token_eq_lit(dst, token_len(dst), dst_lit);
+}
+
+static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
+{
+    const char *src;
+    const char *dst;
+
+    if (!query || !len)
+        return false;
+
+    src = skip_spaces(query);
+    dst = next_token(src);
+
+    /*
+     * contextExists() second stage calls /access with the same hidden context
+     * as source and target.  Hide either side to keep the fallback consistent.
+     *
+     * 这是为了堵住 contextExists() 的第二段 fallback：它会拿同一个 context
+     * 当源和目标去查 /access。只要源或目标是需要隐藏的 dirty context，
+     * 这里就直接 deny。
+     */
+    if (dirtysepolicy_context_should_hide(src) ||
+        dirtysepolicy_context_should_hide(dst))
+        return true;
+
+    /*
+     * AppZygote.java DirtySepolicy access probes:
+     *   system_server -> system_server        process execmem
+     *   shell         -> su                   process transition
+     *   rootfs        -> tmpfs                filesystem associate
+     *   kernel        -> tmpfs                fifo_file open
+     *   kernel        -> adb_data_file        file read
+     *   system_server -> apk_data_file        file execute
+     *   dex2oat       -> dex2oat_exec         file execute_no_trans
+     *   zygote        -> adb_data_file        dir search
+     *
+     * SELinux.java resolves the class/permission bit separately from
+     * /sys/fs/selinux/class and then checks the returned av_decision.allowed.
+     * Matching the context pair here is enough to force the DirtySepolicy
+     * result to false while leaving policy-manager processes bypassed earlier.
+     *
+     * DirtySepolicy 会先从 /sys/fs/selinux/class 读 class/perm 编号，再向
+     * /access 写入 source context、target context 和 class id。这里按它
+     * 固定使用的 context 对拦截即可；管理进程已经在入口处 bypass，不影响
+     * APatch/magiskpolicy 自己操作策略。
+     */
+    if (access_contexts_match(query, "u:r:system_server:s0", "u:r:system_server:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:shell:s0", "u:r:su:s0"))
+        return true;
+    if (access_contexts_match(query, "u:object_r:rootfs:s0", "u:object_r:tmpfs:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:kernel:s0", "u:object_r:tmpfs:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:kernel:s0", "u:object_r:adb_data_file:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:system_server:s0", "u:object_r:apk_data_file:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:dex2oat:s0", "u:object_r:dex2oat_exec:s0"))
+        return true;
+    if (access_contexts_match(query, "u:r:zygote:s0", "u:object_r:adb_data_file:s0"))
+        return true;
+
+    return false;
+}
+
 static bool legacy_clean_query_should_block(const char *query, size_t len, bool access_query)
 {
+    if (access_query && dirtysepolicy_access_should_deny(query, len))
+        return true;
+    if (!access_query && dirtysepolicy_context_should_hide(query))
+        return true;
     if (legacy_should_block_access_query(query, len))
         return true;
     if (!READ_ONCE(g_clean_policy_blob))
@@ -1782,6 +2126,8 @@ static bool legacy_should_block_access_query(const char *query, size_t len)
     if (!query || !len)
         return false;
 
+    if (dirtysepolicy_access_should_deny(query, len))
+        return true;
     if (contains_case_literal(query, len, "magisk"))
         return true;
     if (contains_case_literal(query, len, "ksu_file"))
@@ -2231,6 +2577,24 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
+    if (dirtysepolicy_access_should_deny(sample, sample_len)) {
+        n = READ_ONCE(g_clean_access_count) + 1;
+        WRITE_ONCE(g_clean_access_count, n);
+        a->local.data0 = 4;
+        a->local.data1 = n;
+        slot = n & (ACCESS_PROBE_SLOTS - 1);
+        a->local.data2 = slot;
+        g_probes[slot].id = n;
+        g_probes[slot].uid = uid;
+        g_probes[slot].node = "access";
+        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+        pr_info("[selinux_hook] DIRTYSEPOLICY deny /sys/fs/selinux/access #%u uid=%d comm=%s query=\"%s\"\n",
+                n, uid, current_comm(), sample);
+        a->skip_origin = 1;
+        a->ret = -EINVAL;
+        return;
+    }
+
     if (!clean_policydb_redirect_supported()) {
         snapshot_clean_policy("legacy_access");
         if (legacy_clean_query_should_block(sample, sample_len, true)) {
@@ -2307,6 +2671,24 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
             log_bypass_once("context", uid, sample);
+        return;
+    }
+
+    if (dirtysepolicy_context_should_hide(sample)) {
+        n = READ_ONCE(g_clean_access_count) + 1;
+        WRITE_ONCE(g_clean_access_count, n);
+        a->local.data0 = 4;
+        a->local.data1 = n;
+        slot = n & (ACCESS_PROBE_SLOTS - 1);
+        a->local.data2 = slot;
+        g_probes[slot].id = n;
+        g_probes[slot].uid = uid;
+        g_probes[slot].node = "context";
+        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+        pr_info("[selinux_hook] DIRTYSEPOLICY hide /sys/fs/selinux/context #%u uid=%d comm=%s query=\"%s\"\n",
+                n, uid, current_comm(), sample);
+        a->skip_origin = 1;
+        a->ret = -EINVAL;
         return;
     }
 
@@ -2399,94 +2781,27 @@ static void after_sel_write_common(hook_fargs4_t *a, void *u)
                      probe->query);
 }
 
-static int hotpatch_write_op_slot(sel_write_op_fn *slot, sel_write_op_fn value,
-                                  sel_write_op_fn *old_value)
-{
-    unsigned long old_raw;
-    unsigned long new_raw;
-    int rc;
-
-    if (!slot || !value)
-        return -EINVAL;
-
-    old_raw = (unsigned long)READ_ONCE(*slot);
-    new_raw = (unsigned long)value;
-    if (old_value)
-        *old_value = (sel_write_op_fn)old_raw;
-
-    rc = hotpatch_nosync((void *)slot, (uint32_t)new_raw);
-    if (rc)
-        return rc;
-
-    rc = hotpatch_nosync((void *)((unsigned long)slot + sizeof(uint32_t)),
-                         (uint32_t)(new_raw >> 32));
-    if (rc) {
-        hotpatch_nosync((void *)slot, (uint32_t)old_raw);
-        return rc;
-    }
-
-    return 0;
-}
-
-static ssize_t run_sel_write_op_filter(const char *node, sel_write_op_fn origin,
-                                       void (*before)(hook_fargs4_t *a, void *u),
-                                       struct file *file, char *buf, size_t size)
-{
-    hook_fargs4_t a;
-
-    zero_bytes(&a, sizeof(a));
-    a.arg0 = (uint64_t)file;
-    a.arg1 = (uint64_t)buf;
-    a.arg2 = (uint64_t)size;
-
-    before(&a, NULL);
-    if (!a.skip_origin) {
-        if (!origin) {
-            pr_warn("[selinux_hook] missing original write_op for %s\n", node ?: "?");
-            a.ret = -EINVAL;
-        } else {
-            a.ret = (uint64_t)origin((struct file *)a.arg0, (char *)a.arg1, (size_t)a.arg2);
-        }
-    }
-    after_sel_write_common(&a, NULL);
-
-    return (ssize_t)a.ret;
-}
-
-static ssize_t hooked_sel_write_access(struct file *file, char *buf, size_t size)
-{
-    return run_sel_write_op_filter("access", g_orig_write_op_access,
-                                   before_sel_write_access, file, buf, size);
-}
-
-static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t size)
-{
-    return run_sel_write_op_filter("context", g_orig_write_op_context,
-                                   before_sel_write_context, file, buf, size);
-}
-
 static int install_write_op_hooks(void)
 {
     unsigned long addr_access, addr_context;
-    sel_write_op_fn *write_op;
-    int rc;
+    void *write_op;
 
     /* Prefer direct symbol lookup; fall back to LLVM-suffix variant */
-    addr_access = (unsigned long)kallsyms_lookup_name("sel_write_access");
-    if (!addr_access)
-        addr_access = lookup_name_with_suffix("sel_write_access");
+    addr_access = (unsigned long)lookup_name_optional_suffix("sel_write_access");
 
-    addr_context = (unsigned long)kallsyms_lookup_name("sel_write_context");
-    if (!addr_context)
-        addr_context = lookup_name_with_suffix("sel_write_context");
+    addr_context = (unsigned long)lookup_name_optional_suffix("sel_write_context");
+    log_symbol_addr("sel_write_access", (void *)addr_access);
+    log_symbol_addr("sel_write_context", (void *)addr_context);
 
     if (addr_access) {
         g_funcs[g_hooks++] = (void *)addr_access;
+        pr_info("[selinux_hook] hook sel_write_access argc=3 mode=direct\n");
         hook_wrap((void *)addr_access, 3, before_sel_write_access, after_sel_write_common, NULL);
         selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
 
         if (addr_context) {
             g_funcs[g_hooks++] = (void *)addr_context;
+            pr_info("[selinux_hook] hook sel_write_context argc=3 mode=direct\n");
             hook_wrap((void *)addr_context, 3, before_sel_write_context, after_sel_write_common, NULL);
             selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
         } else {
@@ -2495,69 +2810,51 @@ static int install_write_op_hooks(void)
         return 0;
     }
 
-    /* Fallback: patch the write_op function pointer table */
-    write_op = (sel_write_op_fn *)kallsyms_lookup_name("write_op");
+    /*
+     * write_op[] fallback notes:
+     *
+     * The referenced 4.14 selinuxfs.c trees confirm:
+     *   SEL_CONTEXT == 5
+     *   SEL_ACCESS  == 6
+     *
+     * Older builds patched write_op[5]/write_op[6] with hotpatch_nosync when
+     * direct sel_write_access()/sel_write_context() symbols were missing.
+     * The APatch bugreport captured on this cepheus device shows:
+     *   KernelPatch Version: c02
+     *   KP E unknown symbol: hotpatch_nosync
+     *   KP load kpm: selinux_magisk_access_filter, rc: -2
+     *
+     * 这不是 SELinux hook 逻辑失败，而是 KPM loader 在重定位阶段就找不到
+     * hotpatch_nosync，导致 init() 都不会执行。为了让模块至少能加载并打印
+     * 诊断，本分支完全避免静态导入 hotpatch_nosync；如果 direct symbol
+     * 不存在，就记录降级原因，而不是再尝试写 write_op[]。
+     *
+     * That failure happens before module init(), so this c02-compatible build
+     * deliberately avoids importing hotpatch_nosync at all.  If direct symbols
+     * are absent, log the downgrade and keep the KPM loaded for diagnostics
+     * instead of failing relocation.
+     */
+    if (!write_op_slot_fallback_allowed()) {
+        pr_warn("[selinux_hook] sel_write_access unresolved; skip hardcoded write_op[%d/%d] fallback because legacy route lacks 4.14 selinux_state baseline kver=%x\n",
+                SEL_WRITE_OP_CONTEXT, SEL_WRITE_OP_ACCESS, kver);
+        return 0;
+    }
+
+    write_op = lookup_name_optional_suffix("write_op");
+    log_symbol_addr("write_op", write_op);
     if (!write_op) {
-        pr_err("[selinux_hook] cannot find sel_write_access or write_op\n");
-        return -ENOENT;
+        pr_warn("[selinux_hook] sel_write_access unresolved and write_op missing; access/context hooks skipped\n");
+        return 0;
     }
 
-    g_write_op_context_slot = &write_op[SEL_WRITE_OP_CONTEXT];
-    g_write_op_access_slot = &write_op[SEL_WRITE_OP_ACCESS];
-
-    if (!READ_ONCE(*g_write_op_access_slot)) {
-        pr_err("[selinux_hook] write_op access slot is empty\n");
-        return -ENOENT;
-    }
-
-    rc = hotpatch_write_op_slot(g_write_op_access_slot, hooked_sel_write_access,
-                                &g_orig_write_op_access);
-    if (rc) {
-        pr_err("[selinux_hook] patch write_op access failed rc=%d\n", rc);
-        return rc;
-    }
-    g_write_op_access_patched = true;
-
-    if (READ_ONCE(*g_write_op_context_slot)) {
-        rc = hotpatch_write_op_slot(g_write_op_context_slot, hooked_sel_write_context,
-                                    &g_orig_write_op_context);
-        if (rc) {
-            pr_err("[selinux_hook] patch write_op context failed rc=%d\n", rc);
-            uninstall_write_op_hooks();
-            return rc;
-        }
-        g_write_op_context_patched = true;
-    } else {
-        pr_warn("[selinux_hook] write_op context slot is empty\n");
-    }
-
-    selinux_hook_dbg("[selinux_hook] write_op hooks installed access=%px->%px context=%px->%px\n",
-                     g_orig_write_op_access, hooked_sel_write_access,
-                     g_orig_write_op_context, hooked_sel_write_context);
+    pr_warn("[selinux_hook] write_op[%d/%d] fallback unavailable on this KP core because hotpatch_nosync is not exported; direct sel_write_access hook is required\n",
+            SEL_WRITE_OP_CONTEXT, SEL_WRITE_OP_ACCESS);
     return 0;
 }
 
 static void uninstall_write_op_hooks(void)
 {
-    int rc;
-
-    if (g_write_op_context_patched && g_write_op_context_slot && g_orig_write_op_context) {
-        rc = hotpatch_write_op_slot(g_write_op_context_slot, g_orig_write_op_context, NULL);
-        if (rc)
-            pr_warn("[selinux_hook] restore write_op context failed rc=%d\n", rc);
-    }
-    g_write_op_context_patched = false;
-    g_write_op_context_slot = NULL;
-    g_orig_write_op_context = NULL;
-
-    if (g_write_op_access_patched && g_write_op_access_slot && g_orig_write_op_access) {
-        rc = hotpatch_write_op_slot(g_write_op_access_slot, g_orig_write_op_access, NULL);
-        if (rc)
-            pr_warn("[selinux_hook] restore write_op access failed rc=%d\n", rc);
-    }
-    g_write_op_access_patched = false;
-    g_write_op_access_slot = NULL;
-    g_orig_write_op_access = NULL;
+    /* No write_op[] slots are modified on KP c02-compatible builds. */
 }
 
 static void uninstall_inline_hooks(void)
@@ -2590,7 +2887,10 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     sample_len = value && size ? copy_query_sample(sample, (const char *)value, size) : 0;
     manager = current_is_policy_manager();
     if (!manager) {
-        if (!READ_ONCE(g_clean_policydb) && READ_ONCE(g_clean_policy_blob) &&
+        if (dirtysepolicy_context_should_hide(sample)) {
+            clean_checked = true;
+            clean_ret = -EINVAL;
+        } else if (!READ_ONCE(g_clean_policydb) && READ_ONCE(g_clean_policy_blob) &&
             legacy_should_block_access_query(sample, sample_len)) {
             clean_checked = true;
             clean_ret = -EINVAL;
@@ -3092,74 +3392,91 @@ static long init(const char *args, const char *event, void *__user r)
                      (unsigned)(kver >> 16), (unsigned)((kver >> 8) & 0xff),
                      get_u32_le(g_clean_status_bytes + 4),
                      get_u32_le(g_clean_status_bytes + 12));
+    pr_info("[selinux_hook] kernel kver=%x legacy_blob=%d blob_route=%d\n",
+            kver, use_legacy_clean_blob_query() ? 1 : 0,
+            use_clean_blob_route() ? 1 : 0);
+    resolve_required_symbols_once();
 
     /* Raw spinlock helpers — kfunc wrappers are not exported on this kernel,
      * so resolve through kallsyms and call via function pointer.  The locks
      * become no-ops if resolution fails, which is acceptable for these
      * scope arrays (they only see per-task scope entry/exit pairs that
      * are also serialized against themselves). */
-    g_raw_spin_lock_fn = (raw_spin_lock_fn_t)kallsyms_lookup_name("_raw_spin_lock");
-    g_raw_spin_unlock_fn = (raw_spin_unlock_fn_t)kallsyms_lookup_name("_raw_spin_unlock");
+    g_raw_spin_lock_fn = (raw_spin_lock_fn_t)lookup_name_optional_suffix("_raw_spin_lock");
+    g_raw_spin_unlock_fn = (raw_spin_unlock_fn_t)lookup_name_optional_suffix("_raw_spin_unlock");
     if (!g_raw_spin_lock_fn || !g_raw_spin_unlock_fn)
-        pr_warn("[selinux_hook] raw_spin_lock/unlock unresolved: lock=%px unlock=%px — scope/cache lock will be a no-op\n",
+        pr_warn("[selinux_hook] raw_spin_lock/unlock unresolved: lock=%px unlock=%px; scope/cache lock will be a no-op\n",
                 g_raw_spin_lock_fn, g_raw_spin_unlock_fn);
 
-    copy_from_kernel_nofault_fn = (void *)kallsyms_lookup_name("copy_from_kernel_nofault");
+    copy_from_kernel_nofault_fn = (void *)lookup_name_optional_suffix("copy_from_kernel_nofault");
     if (!copy_from_kernel_nofault_fn)
-        copy_from_kernel_nofault_fn = (void *)kallsyms_lookup_name("probe_kernel_read");
-    copy_to_user_nofault_fn = (void *)kallsyms_lookup_name("copy_to_user_nofault");
+        copy_from_kernel_nofault_fn = (void *)lookup_name_optional_suffix("probe_kernel_read");
+    copy_to_user_nofault_fn = (void *)lookup_name_optional_suffix("copy_to_user_nofault");
     if (copy_to_user_nofault_fn) {
         g_copy_to_user_name = "copy_to_user_nofault";
     } else {
-        copy_to_user_raw_fn = (void *)kallsyms_lookup_name("_copy_to_user");
+        copy_to_user_raw_fn = (void *)lookup_name_optional_suffix("_copy_to_user");
         if (copy_to_user_raw_fn) {
             g_copy_to_user_name = "_copy_to_user";
         } else {
-            copy_to_user_raw_fn = (void *)kallsyms_lookup_name("__copy_to_user");
+            copy_to_user_raw_fn = (void *)lookup_name_optional_suffix("__copy_to_user");
             if (copy_to_user_raw_fn)
                 g_copy_to_user_name = "__copy_to_user";
         }
     }
     if (!copy_to_user_nofault_fn && !copy_to_user_raw_fn)
         pr_warn("[selinux_hook] cannot find raw copy_to_user, status hook will use compat_copy_to_user fallback\n");
-    vmalloc_fn = (void *)kallsyms_lookup_name("vmalloc");
+    vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc");
     if (!vmalloc_fn)
-        vmalloc_fn = (void *)kallsyms_lookup_name("vmalloc_noprof");
-    vfree_fn = (void *)kallsyms_lookup_name("vfree");
-    init_task_ptr = (void *)kallsyms_lookup_name("init_task");
-    filp_open_fn = (void *)kallsyms_lookup_name("filp_open");
-    filp_close_fn = (void *)kallsyms_lookup_name("filp_close");
-    kernel_read_fn = (void *)kallsyms_lookup_name("kernel_read");
-    vfs_llseek_fn = (void *)kallsyms_lookup_name("vfs_llseek");
-    g_selinux_state = (void *)kallsyms_lookup_name("selinux_state");
+        vmalloc_fn = (void *)lookup_name_optional_suffix("vmalloc_noprof");
+    vfree_fn = (void *)lookup_name_optional_suffix("vfree");
+    init_task_ptr = lookup_name_optional_suffix("init_task");
+    filp_open_fn = (void *)lookup_name_optional_suffix("filp_open");
+    filp_close_fn = (void *)lookup_name_optional_suffix("filp_close");
+    kernel_read_fn = (void *)lookup_name_optional_suffix("kernel_read");
+    vfs_llseek_fn = (void *)lookup_name_optional_suffix("vfs_llseek");
+    g_selinux_state = lookup_name_optional_suffix("selinux_state");
     if (!init_task_ptr)
         pr_warn("[selinux_hook] cannot find init_task, mock policy process gate disabled\n");
     if (!filp_open_fn || !filp_close_fn || !kernel_read_fn || !vfs_llseek_fn)
         pr_warn("[selinux_hook] cannot find file-read symbols: filp_open=%px filp_close=%px kernel_read=%px vfs_llseek=%px\n",
                 filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn);
-    security_load_policy_fn = (void *)kallsyms_lookup_name("security_load_policy");
+    security_load_policy_fn = (void *)lookup_name_optional_suffix("security_load_policy");
     security_load_policy_compat_fn = (void *)security_load_policy_fn;
-    security_context_to_sid_fn = (void *)kallsyms_lookup_name("security_context_to_sid");
+    security_context_to_sid_fn = (void *)lookup_name_optional_suffix("security_context_to_sid");
     security_context_to_sid_compat_fn = (void *)security_context_to_sid_fn;
-    policydb_read_fn = (void *)kallsyms_lookup_name("policydb_read");
-    policydb_destroy_fn = (void *)kallsyms_lookup_name("policydb_destroy");
-    flex_array_get_fn = (void *)kallsyms_lookup_name("flex_array_get");
-    avtab_search_node_fn = (void *)kallsyms_lookup_name("avtab_search_node");
-    avtab_search_node_next_fn = (void *)kallsyms_lookup_name("avtab_search_node_next");
-    cond_compute_av_fn = (void *)kallsyms_lookup_name("cond_compute_av");
-    if (!cond_compute_av_fn && kver >= VERSION(5, 10, 0))
-        cond_compute_av_fn = (void *)lookup_name_with_suffix("cond_compute_av");
-    constraint_expr_eval_fn = (void *)kallsyms_lookup_name("constraint_expr_eval");
-    if (!constraint_expr_eval_fn && kver >= VERSION(5, 10, 0))
-        constraint_expr_eval_fn = (void *)lookup_name_with_suffix("constraint_expr_eval");
-    type_attribute_bounds_av_fn = (void *)kallsyms_lookup_name("type_attribute_bounds_av");
-    if (!type_attribute_bounds_av_fn && kver >= VERSION(5, 10, 0))
-        type_attribute_bounds_av_fn = (void *)lookup_name_with_suffix("type_attribute_bounds_av");
-    selinux_policy_cancel_fn = (void *)kallsyms_lookup_name("selinux_policy_cancel");
+    policydb_read_fn = (void *)lookup_name_optional_suffix("policydb_read");
+    policydb_destroy_fn = (void *)lookup_name_optional_suffix("policydb_destroy");
+    flex_array_get_fn = (void *)lookup_name_optional_suffix("flex_array_get");
+    avtab_search_node_fn = (void *)lookup_name_optional_suffix("avtab_search_node");
+    avtab_search_node_next_fn = (void *)lookup_name_optional_suffix("avtab_search_node_next");
+    cond_compute_av_fn = (void *)lookup_name_optional_suffix("cond_compute_av");
+    constraint_expr_eval_fn = (void *)lookup_name_optional_suffix("constraint_expr_eval");
+    type_attribute_bounds_av_fn = (void *)lookup_name_optional_suffix("type_attribute_bounds_av");
+    selinux_policy_cancel_fn = (void *)lookup_name_optional_suffix("selinux_policy_cancel");
     selinux_policy_cancel_compat_fn = (void *)selinux_policy_cancel_fn;
-    sidtab_cancel_convert_fn = (void *)kallsyms_lookup_name("sidtab_cancel_convert");
-    security_read_policy_fn = (void *)kallsyms_lookup_name("security_read_policy");
+    sidtab_cancel_convert_fn = (void *)lookup_name_optional_suffix("sidtab_cancel_convert");
+    security_read_policy_fn = (void *)lookup_name_optional_suffix("security_read_policy");
     security_read_policy_compat_fn = (void *)security_read_policy_fn;
+    log_symbol_addr("selinux_state", g_selinux_state);
+    log_symbol_addr("security_read_policy", (void *)security_read_policy_fn);
+    log_symbol_addr("security_context_to_sid", (void *)security_context_to_sid_fn);
+    log_symbol_addr("security_load_policy", (void *)security_load_policy_fn);
+    log_symbol_addr("policydb_read", (void *)policydb_read_fn);
+    log_symbol_addr("policydb_destroy", (void *)policydb_destroy_fn);
+    log_symbol_addr("avtab_search_node", (void *)avtab_search_node_fn);
+    log_symbol_addr("avtab_search_node_next", (void *)avtab_search_node_next_fn);
+    log_symbol_addr("cond_compute_av", (void *)cond_compute_av_fn);
+    log_symbol_addr("constraint_expr_eval", (void *)constraint_expr_eval_fn);
+    log_symbol_addr("type_attribute_bounds_av", (void *)type_attribute_bounds_av_fn);
+    log_symbol_addr("selinux_policy_cancel", (void *)selinux_policy_cancel_fn);
+    log_symbol_addr("sidtab_cancel_convert", (void *)sidtab_cancel_convert_fn);
+    pr_info("[selinux_hook] compat route: state_calls=%d policydb_redirect=%d policydb_offset_fallback=%d write_op_fallback=%d load_state=%d\n",
+            selinux_compat_call_needed() ? 1 : 0,
+            clean_policydb_redirect_supported() ? 1 : 0,
+            policydb_offset_fallback_allowed() ? 1 : 0,
+            write_op_slot_fallback_allowed() ? 1 : 0,
+            security_load_policy_has_load_state() ? 1 : 0);
     if (selinux_compat_call_needed())
         pr_info("[selinux_hook] SELinux compat calls enabled kver=%x state=%px\n",
                 kver, g_selinux_state);
@@ -3193,7 +3510,7 @@ static long init(const char *args, const char *event, void *__user r)
             hook_wrap((void *)security_read_policy_fn, 2, before_security_read_policy, NULL, NULL);
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("simple_read_from_buffer");
+    addr = (unsigned long)lookup_name_optional_suffix("simple_read_from_buffer");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         WRITE_ONCE(g_simple_read_from_buffer_hooked, true);
@@ -3204,9 +3521,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find simple_read_from_buffer, status hook will use direct user copy fallback\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("sel_read_handle_status");
-    if (!addr)
-        addr = lookup_name_with_suffix("sel_read_handle_status");
+    addr = (unsigned long)lookup_name_optional_suffix("sel_read_handle_status");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         selinux_hook_dbg("[selinux_hook] hook sel_read_handle_status argc=4\n");
@@ -3216,10 +3531,8 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find sel_read_handle_status, status read hook skipped\n");
     }
 
-    /* Hook the mmap handler — Android libselinux uses mmap() not read() */
-    addr = (unsigned long)kallsyms_lookup_name("sel_mmap_handle_status");
-    if (!addr)
-        addr = lookup_name_with_suffix("sel_mmap_handle_status");
+    /* Hook the mmap handler; Android libselinux uses mmap() not read(). */
+    addr = (unsigned long)lookup_name_optional_suffix("sel_mmap_handle_status");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         selinux_hook_dbg("[selinux_hook] hook sel_mmap_handle_status argc=2\n");
@@ -3229,9 +3542,7 @@ static long init(const char *args, const char *event, void *__user r)
     }
 
     /* Freeze status page sequence/policyload on old kernels */
-    addr = (unsigned long)kallsyms_lookup_name("selinux_status_update_seqlock");
-    if (!addr && kver >= VERSION(5, 10, 0))
-        addr = lookup_name_with_suffix("selinux_status_update_seqlock");
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_status_update_seqlock");
     if (addr) {
         /* argc=1 on < 5.19 (state arg), argc=0 on >= 5.19 */
         int argc = (kver < VERSION(5, 19, 0)) ? 1 : 0;
@@ -3242,9 +3553,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find selinux_status_update_seqlock\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("selinux_status_update_policyload");
-    if (!addr && kver >= VERSION(5, 10, 0))
-        addr = lookup_name_with_suffix("selinux_status_update_policyload");
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_status_update_policyload");
     if (addr) {
         /* argc=2 on < 5.19 (state, seqno), argc=1 on >= 5.19 (seqno) */
         int argc = (kver < VERSION(5, 19, 0)) ? 2 : 1;
@@ -3261,7 +3570,7 @@ static long init(const char *args, const char *event, void *__user r)
         selinux_hook_dbg("[selinux_hook] security_load_policy hook skipped; clean snapshots call it directly\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("security_setprocattr");
+    addr = (unsigned long)lookup_name_optional_suffix("security_setprocattr");
     if (addr) {
         bool setprocattr_lsm_arg = security_setprocattr_has_lsm_arg();
 
@@ -3276,9 +3585,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find security_setprocattr\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("selinux_setprocattr");
-    if (!addr)
-        addr = lookup_name_with_suffix("selinux_setprocattr");
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_setprocattr");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         selinux_hook_dbg("[selinux_hook] hook selinux_setprocattr argc=3\n");
@@ -3293,16 +3600,15 @@ static long init(const char *args, const char *event, void *__user r)
         return rc;
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("context_struct_compute_av");
-    if (!addr)
-        addr = lookup_name_with_suffix("context_struct_compute_av");
+    addr = (unsigned long)lookup_name_optional_suffix("context_struct_compute_av");
     if (addr) {
-        g_funcs[g_hooks++] = (void *)addr;
         if (clean_policydb_redirect_supported()) {
+            g_funcs[g_hooks++] = (void *)addr;
             pr_info("[selinux_hook] hook context_struct_compute_av argc=6\n");
             hook_wrap((void *)addr, 6, before_context_struct_compute_av_policydb,
                       after_context_struct_compute_av_policydb, NULL);
         } else {
+            g_funcs[g_hooks++] = (void *)addr;
             pr_info("[selinux_hook] hook legacy context_struct_compute_av argc=5\n");
             hook_wrap((void *)addr, 5, before_context_struct_compute_av_legacy, NULL, NULL);
         }
@@ -3310,7 +3616,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find context_struct_compute_av\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("string_to_context_struct");
+    addr = (unsigned long)lookup_name_optional_suffix("string_to_context_struct");
     if (addr && clean_policydb_redirect_supported()) {
         g_funcs[g_hooks++] = (void *)addr;
         pr_info("[selinux_hook] hook string_to_context_struct argc=5\n");
@@ -3321,7 +3627,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find string_to_context_struct\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("selinux_complete_init");
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_complete_init");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         pr_info("[selinux_hook] hook selinux_complete_init argc=0\n");
@@ -3330,7 +3636,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find selinux_complete_init\n");
     }
 
-    addr = (unsigned long)kallsyms_lookup_name("selinux_policy_commit");
+    addr = (unsigned long)lookup_name_optional_suffix("selinux_policy_commit");
     if (addr) {
         g_funcs[g_hooks++] = (void *)addr;
         pr_info("[selinux_hook] hook selinux_policy_commit argc=1\n");
