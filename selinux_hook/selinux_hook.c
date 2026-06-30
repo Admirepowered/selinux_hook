@@ -25,7 +25,7 @@
 #include <kputils.h>
 
 KPM_NAME("selinux_magisk_access_filter");
-KPM_VERSION("1.1.2");
+KPM_VERSION("1.1.3");
 KPM_LICENSE("All rights reserved.");
 KPM_AUTHOR("Admire");
 KPM_DESCRIPTION("Audit and reject Magisk /sys/fs/selinux/access probes");
@@ -2040,6 +2040,55 @@ static bool access_contexts_match(const char *query, const char *src_lit,
            token_eq_lit(dst, token_len(dst), dst_lit);
 }
 
+static bool access_query_matches3(const char *query, const char *src_lit,
+                                  const char *dst_lit, const char *class_lit)
+{
+    const char *src;
+    const char *dst;
+    const char *tclass;
+
+    src = skip_spaces(query);
+    dst = next_token(src);
+    tclass = next_token(dst);
+
+    return token_eq_lit(src, token_len(src), src_lit) &&
+           token_eq_lit(dst, token_len(dst), dst_lit) &&
+           token_eq_lit(tclass, token_len(tclass), class_lit);
+}
+
+static bool dirtysepolicy_avd_seqno_probe(const char *query, size_t len)
+{
+    if (!query || !len)
+        return false;
+
+    /*
+     * AppZygote.java checks avd[4] from:
+     *   SELinux.access("u:r:untrusted_app:s0",
+     *                  "u:r:untrusted_app:s0", 0)
+     *
+     * 这条不是 allow/deny 探针，而是读取 /sys/fs/selinux/access 返回的
+     * av_decision.seqno。只 patch /sys/fs/selinux/status 不够；这里直接识别
+     * 固定查询并返回 clean seqno=1，避免 live policy seqno 泄漏。
+     */
+    return access_query_matches3(query, "u:r:untrusted_app:s0",
+                                 "u:r:untrusted_app:s0", "0");
+}
+
+static long write_clean_access_seqno_response(char *buf, size_t size)
+{
+    static const char response[] = "0 0 0 0 1 0";
+    size_t len = sizeof(response) - 1;
+
+    if (!buf || size < len)
+        return -EINVAL;
+
+    copy_bytes(buf, response, len);
+    if (size > len)
+        buf[len] = '\0';
+
+    return (long)len;
+}
+
 static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
 {
     const char *src;
@@ -2574,6 +2623,28 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
     if (should_bypass_clean_filter(uid)) {
         if (should_log_live_bypass(uid))
             log_bypass_once("access", uid, sample);
+        return;
+    }
+
+    if (dirtysepolicy_avd_seqno_probe(sample, sample_len)) {
+        long ret;
+
+        n = READ_ONCE(g_clean_access_count) + 1;
+        WRITE_ONCE(g_clean_access_count, n);
+        a->local.data0 = 5;
+        a->local.data1 = n;
+        slot = n & (ACCESS_PROBE_SLOTS - 1);
+        a->local.data2 = slot;
+        g_probes[slot].id = n;
+        g_probes[slot].uid = uid;
+        g_probes[slot].node = "access";
+        copy_bytes(g_probes[slot].query, sample, ACCESS_SAMPLE_MAX);
+
+        ret = write_clean_access_seqno_response((char *)a->arg1, size);
+        pr_info("[selinux_hook] DIRTYSEPOLICY clean avd seqno /sys/fs/selinux/access #%u uid=%d comm=%s ret=%ld query=\"%s\"\n",
+                n, uid, current_comm(), ret, sample);
+        a->skip_origin = 1;
+        a->ret = (ret > 0) ? (uint64_t)ret : (uint64_t)-EINVAL;
         return;
     }
 
