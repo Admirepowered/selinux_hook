@@ -26,7 +26,7 @@
 
 KPM_NAME("selinux_magisk_access_filter");
 #ifndef SELINUX_VERSION
-#define SELINUX_VERSION "1.1.4"
+#define SELINUX_VERSION "1.1.5"
 #endif
 KPM_VERSION(SELINUX_VERSION);
 KPM_LICENSE("All rights reserved.");
@@ -73,6 +73,15 @@ static sel_write_op_fn g_orig_write_op_access;
 static sel_write_op_fn g_orig_write_op_context;
 static bool g_write_op_access_patched;
 static bool g_write_op_context_patched;
+/*
+ * Deferred write_op install marker:
+ * Set when init() ran before SELinux was ready (pre-kernel-init event) and
+ * skipped install_write_op_hooks(). The after_selinux_complete_init() /
+ * after_selinux_policy_commit() handlers pick it up once the kernel has
+ * finished re-patching sel_write_access()/write_op[] to install the filter
+ * hook against the final, stable address.
+ */
+static bool g_write_op_install_deferred;
 static long (*copy_from_kernel_nofault_fn)(void *dst, const void *src, size_t size);
 static long (*copy_to_user_nofault_fn)(void __user *dst, const void *src, size_t size);
 static unsigned long (*copy_to_user_raw_fn)(void __user *dst, const void *src, unsigned long size);
@@ -549,6 +558,14 @@ static ssize_t hooked_sel_write_context(struct file *file, char *buf, size_t siz
 static int install_write_op_hooks(void);
 static void uninstall_write_op_hooks(void);
 static void uninstall_inline_hooks(void);
+/*
+ * Forward declarations for deferred write_op install:
+ * Defined later (near after_selinux_complete_init); declared here so init()
+ * can reference them and so try_complete_deferred_write_op_install() can call
+ * install_write_op_hooks() without an implicit-declaration warning.
+ */
+static bool event_is_post_init(const char *event);
+static void try_complete_deferred_write_op_install(const char *reason);
 static void after_sel_mmap_handle_status(hook_fargs2_t *a, void *u);
 static void before_selinux_status_update_seqlock(hook_fargs4_t *a, void *u);
 static void before_selinux_status_update_policyload(hook_fargs4_t *a, void *u);
@@ -777,9 +794,9 @@ static bool use_legacy_clean_blob_query(void)
 }
 
 /*
- * 4.9-only gate / 仅 4.9 开关：
+ * 4.9-only gate:
  * All Polaris 4.9 ABI branches should enter through this helper so 4.14/5.x/6.x
- * keep their existing paths. 所有 4.9 专用逻辑都集中走这里，避免误伤其他内核。
+ * keep their existing paths.
  */
 static bool selinux_49_compat_path(void)
 {
@@ -808,10 +825,12 @@ static bool clean_policydb_redirect_supported(void)
      *   - security/selinux/selinuxfs.c
      *       sel_write_access(), sel_write_context(), write_op[]
      *
-     * 这里的 4.14 适配不是单纯按 kver 猜 ABI，而是用上述 cepheus/sm8150
-     * 4.14 源码确认 SELinux helper 的真实签名。只要运行时能解析到
-     * selinux_state，就认为它符合这组 4.14 stateful SELinux 布局；否则
-     * 回退到更保守的 legacy 路径，避免把 policydb 参数强套到未知布局上。
+     * The 4.14 adaptation here is not a pure kver-based ABI guess; it uses the
+     * cepheus/sm8150 4.14 sources listed above to confirm the real SELinux
+     * helper signatures. As long as selinux_state resolves at runtime, the
+     * 4.14 stateful SELinux layout is assumed; otherwise fall back to the
+     * more conservative legacy route to avoid forcing the policydb argument
+     * onto an unknown layout.
      *
      * The Xiaomi sm8150/cepheus 4.14 lineage keeps selinux_state and also uses
      * the policydb-argument context_struct_compute_av() signature.  Therefore
@@ -826,7 +845,7 @@ static bool current_is_policy_manager(void)
 {
     const char *comm = current_comm();
 
-    /* 4.9 only / 仅 4.9：APatch UI 用 UID 放行，避免误拦管理器自身查询。 */
+    /* 4.9 only: APatch UI uses a UID bypass to avoid blocking the manager's own queries. */
     if (selinux_49_compat_path()) {
         uid_t apatch_uid = READ_ONCE(g_apatch_manager_uid);
         if (apatch_uid != (uid_t)-1 && current_uid() == apatch_uid)
@@ -869,9 +888,10 @@ static void log_bypass_once(const char *node, uid_t uid, const char *query)
 static bool selinux_compat_call_needed(void)
 {
     /*
-     * 4.14 参考源码里的 security_read_policy() / security_context_to_sid()
-     * 都需要 struct selinux_state * 作为第一个参数。这里用 selinux_state
-     * 作为运行时信号，避免在没有 stateful ABI 的旧内核上误传参数。
+     * security_read_policy() and security_context_to_sid() in the 4.14
+     * sources listed above need a struct selinux_state * first argument.
+     * Use selinux_state as the runtime signal to avoid passing the wrong ABI
+     * on older kernels without a stateful layout.
      *
      * security_read_policy() and security_context_to_sid() are stateful on the
      * 4.14 sources listed above.  Keep the state argument through the Android
@@ -884,9 +904,10 @@ static bool selinux_compat_call_needed(void)
 static bool policydb_offset_fallback_allowed(void)
 {
     /*
-     * policydb 偏移不能靠 sizeof(void *) 盲猜。只有确认当前内核像已审计的
-     * 4.14 sm8150/cepheus stateful 布局，或者已经是非 legacy 的新内核时，
-     * 才允许这个兜底；否则宁可跳过高风险路径。
+     * Do not guess policydb layout by sizeof(void *) on pre-baseline legacy
+     * kernels. The fallback is only allowed once the runtime looks like the
+     * audited 4.14 sm8150/cepheus stateful SELinux layout or a newer
+     * non-legacy kernel; otherwise skip the high-risk path.
      *
      * Do not guess policydb layout on pre-baseline legacy kernels.  The old
      * sizeof(void *) fallback is only acceptable once the runtime looks like
@@ -919,10 +940,11 @@ static bool security_setprocattr_has_lsm_arg(void)
 static bool security_load_policy_has_load_state(void)
 {
     /*
-     * 4.14 的 security_load_policy() 会直接提交 live policy，没有新版
-     * load_state/cancel 流程。只有解析到 selinux_policy_cancel 这类新版
-     * 辅助符号时，才走带 load_state 的调用；否则使用 clean blob /
-     * policydb_read 路线。
+     * The referenced 4.14 services.c commits the loaded policy directly:
+     *   security_load_policy(struct selinux_state *state, void *data, size_t len)
+     * It has no newer staged load_state/cancel flow. Only use the load_state
+     * form when selinux_policy_cancel-style helpers resolve; otherwise fall
+     * back to the clean blob / policydb_read route.
      *
      * The referenced 4.14 services.c commits the loaded policy directly:
      *   security_load_policy(struct selinux_state *state, void *data, size_t len)
@@ -1625,9 +1647,9 @@ static ssize_t call_kernel_read_file(struct file *file, void *buf, size_t count,
 }
 
 /*
- * APatch manager UID detection / APatch 管理器 UID 识别：
+ * APatch manager UID detection:
  * Polaris 4.9 uses a UID bypass for APatch UI reads because task names are not
- * a stable manager signal. 仅 4.9 使用该 UID 旁路，其他内核保持原来的 comm 判断。
+ * a stable manager signal.
  */
 static bool package_line_starts_with_apatch(const char *line, const char *end)
 {
@@ -2248,10 +2270,12 @@ static bool dirtysepolicy_context_should_hide(const char *query)
      *       On EINVAL again it writes /proc/self/attr/current; EPERM is still
      *       interpreted as "context exists".
      *
-     * DirtySepolicy 的 contextExists() 不是只测 /sys/fs/selinux/context。
-     * 如果这里只拦 context 节点，它还会继续走 access fallback，最后再写
-     * /proc/self/attr/current；其中 EPERM 也会被它当成“上下文存在”。因此
-     * 这些敏感 context 必须在三条路径里都表现成 EINVAL/不存在。
+     * Because DirtySepolicy's contextExists() does not only probe
+     * /sys/fs/selinux/context, hiding must cover all three paths. Blocking
+     * just the context node still lets it fall through to the access fallback
+     * and finally /proc/self/attr/current, where EPERM is also treated as
+     * "context exists". Therefore these sensitive contexts must present as
+     * EINVAL/missing on all three paths.
      *
      * Because of that three-stage fallback, hiding a dirty context requires all
      * three kernel paths to return an "invalid context" style result for
@@ -2344,9 +2368,10 @@ static bool dirtysepolicy_avd_seqno_probe(const char *query, size_t len)
      *   SELinux.access("u:r:untrusted_app:s0",
      *                  "u:r:untrusted_app:s0", 0)
      *
-     * 这条不是 allow/deny 探针，而是读取 /sys/fs/selinux/access 返回的
-     * av_decision.seqno。只 patch /sys/fs/selinux/status 不够；这里直接识别
-     * 固定查询并返回 clean seqno=1，避免 live policy seqno 泄漏。
+     * This is not an allow/deny probe; it reads the av_decision.seqno
+     * returned by /sys/fs/selinux/access. Patching /sys/fs/selinux/status
+     * alone is insufficient, so this matches the fixed query and returns
+     * a clean seqno=1 to avoid leaking the live policy seqno.
      */
     return access_query_matches3(query, "u:r:untrusted_app:s0",
                                  "u:r:untrusted_app:s0", "0");
@@ -2384,9 +2409,9 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
      * contextExists() second stage calls /access with the same hidden context
      * as source and target.  Hide either side to keep the fallback consistent.
      *
-     * 这是为了堵住 contextExists() 的第二段 fallback：它会拿同一个 context
-     * 当源和目标去查 /access。只要源或目标是需要隐藏的 dirty context，
-     * 这里就直接 deny。
+     * This blocks the second stage of contextExists(): it queries /access
+     * with the same context as both source and target. If either side is a
+     * dirty context that must be hidden, deny here directly.
      */
     if (dirtysepolicy_context_should_hide(src) ||
         dirtysepolicy_context_should_hide(dst))
@@ -2408,10 +2433,11 @@ static bool dirtysepolicy_access_should_deny(const char *query, size_t len)
      * Matching the context pair here is enough to force the DirtySepolicy
      * result to false while leaving policy-manager processes bypassed earlier.
      *
-     * DirtySepolicy 会先从 /sys/fs/selinux/class 读 class/perm 编号，再向
-     * /access 写入 source context、target context 和 class id。这里按它
-     * 固定使用的 context 对拦截即可；管理进程已经在入口处 bypass，不影响
-     * APatch/magiskpolicy 自己操作策略。
+     * DirtySepolicy reads class/permission numbers from
+     * /sys/fs/selinux/class first, then writes the source context, target
+     * context, and class id to /access. Matching the fixed context pairs
+     * here is enough; policy-manager processes are already bypassed at the
+     * entry point and are unaffected.
      */
     if (access_contexts_match(query, "u:r:system_server:s0", "u:r:system_server:s0"))
         return true;
@@ -2722,12 +2748,97 @@ static int clean_policy_context_to_sid(const char *query, u32 *out_sid)
     return rc;
 }
 
+/*
+ * event_is_post_init — whether the event is safe for write_op install:
+ *
+ * KernelPatch emits "pre-kernel-init" before SELinux finishes its setup, and
+ * "boot-completed"/"post-kernel-init" (or any non-pre event) afterwards. The
+ * sel_write_access()/write_op[] inline hooks must NOT be installed during the
+ * pre-kernel-init event because the kernel re-patches them later — doing so
+ * on v1.1.4 left a stale hook target that the live kernel no longer called
+ * (before_sel_write_access dropped to 0) and corrupted an execve -> blk-mq
+ * path with a user VA (0x0240049d) inside __blk_mq_alloc_request. Restrict
+ * write_op install to events that fire only after SELinux is stable.
+ */
+static bool event_is_post_init(const char *event)
+{
+    if (!event)
+        return false;
+    if (!strcmp(event, "pre-kernel-init"))
+        return false;
+    return true;
+}
+
+/*
+ * try_complete_deferred_write_op_install:
+ * Called from after_selinux_complete_init()/after_selinux_policy_commit()
+ * once the kernel has finalized sel_write_access()/write_op[]. If init()
+ * deferred the install earlier (g_write_op_install_deferred), perform it
+ * now against the stable addresses so before_sel_write_access actually
+ * fires and the corrupted-execve regression is avoided.
+ *
+ * NOTES:
+ * - On Android boot, after_selinux_policy_commit() typically fires 6 times
+ *   and after_selinux_complete_init() once. Only the first trigger must
+ *   perform install_write_op_hooks(); later triggers must be a no-op,
+ *   otherwise the direct-symbol path would push addr_access into the g_funcs[]
+ *   registry multiple times (array overflow + duplicate unhook), and
+ *   hook_wrap() would chain the same function repeatedly.
+ * - The flag is cleared with WRITE_ONCE under no extra lock: a tiny window
+ *   where two early triggers both read true is tolerated because the second
+ *   one will observe g_write_op_access_patched / g_write_op_context_patched
+ *   and short-circuit inside install_write_op_hooks() (the direct path also
+ *   re-resolves the symbol — same address on stable kernel, so re-hooking
+ *   is idempotent for hotpatch; the g_funcs[] entry duplicate is still
+ *   avoided by the early `g_write_op_install_deferred` checks below).
+ */
+static void try_complete_deferred_write_op_install(const char *reason)
+{
+    int rc;
+
+    /* Only let the first caller that reads deferred=true enter the branch.
+     * Clear the deferred flag first, then check the patched state. Under SMP
+     * concurrency:
+     *  - the chance of another path reading the stale true after clearing is tiny;
+     *  - even so, install_write_op_hooks() self-guards via the
+     *    g_write_op_*_patched flags (the 4.9 path re-writes the same slot when
+     *    patched=true, which is idempotent; the direct path re-hook_wrap of the
+     *    same stable address is also harmless). */
+    if (!READ_ONCE(g_write_op_install_deferred))
+        return;
+
+    WRITE_ONCE(g_write_op_install_deferred, false);
+
+    /* Already installed by a concurrent path? Avoid duplicate g_funcs[] / hook_wrap. */
+    if (READ_ONCE(g_write_op_access_patched) ||
+        READ_ONCE(g_write_op_context_patched)) {
+        pr_info("[selinux_hook] deferred write_op already installed reason=%s\n",
+                reason ?: "?");
+        return;
+    }
+
+    rc = install_write_op_hooks();
+    if (rc) {
+        pr_warn("[selinux_hook] deferred install_write_op_hooks failed reason=%s rc=%d\n",
+                reason ?: "?", rc);
+        /* On failure, write back true so a later trigger retries. In most
+         * cases the failure is permanent (e.g. -ENOENT) and later attempts
+         * fail too, which is the most conservative behavior. */
+        WRITE_ONCE(g_write_op_install_deferred, true);
+        return;
+    }
+
+    pr_info("[selinux_hook] deferred install_write_op_hooks completed reason=%s\n",
+            reason ?: "?");
+}
+
 /* Hook: selinux_complete_init */
 static void after_selinux_complete_init(hook_fargs0_t *a, void *u)
 {
     WRITE_ONCE(g_selinux_ready, true);
     selinux_hook_dbg("[selinux_hook] SELinux complete_init done\n");
     snapshot_clean_policy("complete_init");
+    try_complete_deferred_write_op_install("complete_init");
 }
 
 /* Hook: selinux_policy_commit */
@@ -2743,6 +2854,7 @@ static void after_selinux_policy_commit(hook_fargs1_t *a, void *u)
     selinux_hook_dbg("[selinux_hook] SELinux policy committed, first policy=%px first policydb=%px clean policydb=%px\n",
                      g_first_policy, g_first_policydb, READ_ONCE(g_clean_policydb));
     snapshot_clean_policy("policy_commit");
+    try_complete_deferred_write_op_install("policy_commit");
 }
 
 static void before_policydb_arg0(hook_fargs6_t *a, void *u)
@@ -2754,9 +2866,9 @@ static void before_policydb_arg0(hook_fargs6_t *a, void *u)
     if (!clean_policydb_redirect_supported())
         return;
 
-    if (READ_ONCE(g_internal_policy_load_depth) ||   // 模块内部加载
-        current_is_policy_manager()) {                // magiskpolicy 等
-        return;  // 完全跳过，使用原始 policydb
+    if (READ_ONCE(g_internal_policy_load_depth) ||   // internal module load
+        current_is_policy_manager()) {                // magiskpolicy etc.
+        return;  // skip entirely, use the original policydb
     }
     
     
@@ -2946,7 +3058,7 @@ static void before_sel_write_access(hook_fargs4_t *a, void *u)
         return;
     }
 
-    /* 4.9 path / 4.9 路径：helper ABI 不稳定，只用 legacy probe 过滤。 */
+    /* 4.9 path: helper ABI is unstable, use legacy probe filtering only. */
     if (selinux_49_compat_path()) {
         if (legacy_should_block_access_query(sample, sample_len)) {
             n = READ_ONCE(g_clean_access_count) + 1;
@@ -3064,7 +3176,7 @@ static void before_sel_write_context(hook_fargs4_t *a, void *u)
         return;
     }
 
-    /* 4.9 path / 4.9 路径：helper ABI 不稳定，只用 legacy probe 过滤。 */
+    /* 4.9 path: helper ABI is unstable, use legacy probe filtering only. */
     if (selinux_49_compat_path()) {
         if (legacy_should_block_access_query(sample, sample_len)) {
             n = READ_ONCE(g_clean_access_count) + 1;
@@ -3323,6 +3435,18 @@ static int install_write_op_hooks(void)
     sel_write_op_fn *write_op;
     int rc;
 
+    /* Idempotent guard: since v1.1.5 this is called repeatedly by
+     * try_complete_deferred_write_op_install (after_selinux_policy_commit
+     * fires ~6 times, after_selinux_complete_init fires once). The
+     * direct-symbol branch does g_funcs[g_hooks++] to push
+     * sel_write_access/context into the array, then hook_wrap of the same
+     * stable address — without this guard, repeated installs would overflow
+     * g_funcs[] (capacity 16) and chain the same function through
+     * hook_wrap repeatedly, eventually corrupting unhook. */
+    if (READ_ONCE(g_write_op_access_patched) ||
+        READ_ONCE(g_write_op_context_patched))
+        return 0;
+
     /* Prefer direct symbol lookup; fall back to LLVM-suffix variant */
     addr_access = (unsigned long)lookup_name_optional_suffix("sel_write_access");
     addr_context = (unsigned long)lookup_name_optional_suffix("sel_write_context");
@@ -3330,7 +3454,7 @@ static int install_write_op_hooks(void)
     log_symbol_addr("sel_write_context", (void *)addr_context);
 
     /*
-     * Polaris 4.9 write_op path / Polaris 4.9 write_op 路径：
+     * Polaris 4.9 write_op path:
      * direct sel_write_* symbols are unreliable here; write_op[5]/[6] are the
      * SEL_CONTEXT/SEL_ACCESS slots from the 4.9 selinuxfs layout.
      */
@@ -3376,18 +3500,25 @@ static int install_write_op_hooks(void)
         return 0;
     }
 
-    /* Non-4.9 / 非 4.9：保持原来的 direct-symbol-first hook 顺序。 */
+    /* Non-4.9: keep the original direct-symbol-first hook order. */
     if (addr_access) {
         g_funcs[g_hooks++] = (void *)addr_access;
         pr_info("[selinux_hook] hook sel_write_access argc=3 mode=direct\n");
         hook_wrap((void *)addr_access, 3, before_sel_write_access, after_sel_write_common, NULL);
         selinux_hook_dbg("[selinux_hook] inline hook sel_write_access @ %lx\n", addr_access);
+        /* Even though the slot concept does not apply on the direct path,
+         * set patched to block re-install — the top idempotent guard relies
+         * on these flags. The deferred installer re-enters this branch on
+         * repeated after_selinux_policy_commit triggers; without setting
+         * them, g_funcs[] would overflow and hook_wrap would chain. */
+        WRITE_ONCE(g_write_op_access_patched, true);
 
         if (addr_context) {
             g_funcs[g_hooks++] = (void *)addr_context;
             pr_info("[selinux_hook] hook sel_write_context argc=3 mode=direct\n");
             hook_wrap((void *)addr_context, 3, before_sel_write_context, after_sel_write_common, NULL);
             selinux_hook_dbg("[selinux_hook] inline hook sel_write_context @ %lx\n", addr_context);
+            WRITE_ONCE(g_write_op_context_patched, true);
         } else {
             pr_warn("[selinux_hook] sel_write_context not found, context hook skipped\n");
         }
@@ -3408,10 +3539,12 @@ static int install_write_op_hooks(void)
      *   KP E unknown symbol: hotpatch_nosync
      *   KP load kpm: selinux_magisk_access_filter, rc: -2
      *
-     * 这不是 SELinux hook 逻辑失败，而是 KPM loader 在重定位阶段就找不到
-     * hotpatch_nosync，导致 init() 都不会执行。为了让模块至少能加载并打印
-     * 诊断，本分支完全避免静态导入 hotpatch_nosync；如果 direct symbol
-     * 不存在，就记录降级原因，而不是再尝试写 write_op[]。
+     * This is not a SELinux hook logic failure; the KPM loader cannot find
+     * hotpatch_nosync during relocation, so init() never runs. To let the
+     * module at least load and print diagnostics, this branch avoids
+     * statically importing hotpatch_nosync entirely; if the direct symbol
+     * is missing, it logs the downgrade reason instead of trying to write
+     * write_op[].
      *
      * That failure happens before module init(), so this c02-compatible build
      * deliberately avoids importing hotpatch_nosync at all. If direct symbols
@@ -3518,7 +3651,7 @@ static bool filter_procattr_current(const char *hook, const char *lsm,
     sample[0] = '\0';
     sample_len = value && size ? copy_query_sample(sample, (const char *)value, size) : 0;
     /*
-     * 4.9 setprocattr path / 4.9 setprocattr 路径：
+     * 4.9 setprocattr path:
      * avoid clean policydb helpers with device-specific ABI; only block known
      * DirtySepolicy probes while allowing manager/root callers through.
      */
@@ -3614,9 +3747,10 @@ static void before_security_setprocattr(hook_fargs4_t *a, void *u)
 
 
 /*
- * Shared task-first setprocattr body / 共用的 task-first setprocattr 主体：
+ * Shared task-first setprocattr body:
  * Polaris 4.9 passes (task, name, value, size), so arg0 is not lsm/name and the
- * normal wrappers cannot be reused directly. 两个 4.9 wrapper 只差日志名和计数器。
+ * normal wrappers cannot be reused directly. The two 4.9 wrappers differ only
+ * in log name and counter.
  */
 static void before_task_setprocattr_49(hook_fargs4_t *a, const char *hook,
                                        u32 *counter)
@@ -4151,7 +4285,7 @@ static long init(const char *args, const char *event, void *__user r)
     if (!filp_open_fn || !filp_close_fn || !kernel_read_fn || !vfs_llseek_fn)
         pr_warn("[selinux_hook] cannot find file-read symbols: filp_open=%px filp_close=%px kernel_read=%px vfs_llseek=%px\n",
                 filp_open_fn, filp_close_fn, kernel_read_fn, vfs_llseek_fn);
-    /* 4.9 only / 仅 4.9：解析 APatch 管理器 UID，供 current_is_policy_manager() 使用。 */
+    /* 4.9 only: resolve the APatch manager UID for current_is_policy_manager(). */
     if (selinux_49_compat_path())
         detect_apatch_manager_uid();
     security_load_policy_fn = (void *)lookup_name_optional_suffix("security_load_policy");
@@ -4196,7 +4330,7 @@ static long init(const char *args, const char *event, void *__user r)
     if (!sidtab_cancel_convert_fn)
         pr_warn("[selinux_hook] cannot find sidtab_cancel_convert, clean snapshot may leave live policy busy\n");
     /*
-     * 4.9 security_read_policy ABI is vendor-specific / 4.9 该 helper ABI 依机型变化：
+     * 4.9 security_read_policy ABI is vendor-specific:
      * skip snapshot and hook on 4.9; non-4.9 keeps the existing clean-policy path.
      */
     if (!security_read_policy_fn) {
@@ -4221,7 +4355,7 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] intel_av cannot find type_attribute_bounds_av, type bounds masking will be skipped\n");
 
     if (security_read_policy_fn) {
-        /* Non-4.9 only / 仅非 4.9：4.9 不进入 g_hooks++，避免按错误 ABI hook。 */
+        /* Non-4.9 only: 4.9 skips g_hooks++ to avoid hooking with the wrong ABI. */
         if (!selinux_49_compat_path()) {
             int argc = selinux_compat_call_needed() ? 3 : 2;
 
@@ -4296,7 +4430,7 @@ static long init(const char *args, const char *event, void *__user r)
         selinux_hook_dbg("[selinux_hook] security_load_policy hook skipped; clean snapshots call it directly\n");
     }
 
-    /* setprocattr ABI split / setprocattr ABI 分叉：4.9 是 task-first，其他内核走原签名探测。 */
+    /* setprocattr ABI split: 4.9 is task-first; other kernels probe the original signature. */
     addr = (unsigned long)lookup_name_optional_suffix("security_setprocattr");
     if (addr) {
         if (selinux_49_compat_path()) {
@@ -4333,14 +4467,35 @@ static long init(const char *args, const char *event, void *__user r)
         pr_warn("[selinux_hook] cannot find selinux_setprocattr\n");
     }
 
-    rc = install_write_op_hooks();
-    if (rc) {
-        uninstall_inline_hooks();
-        return rc;
+    /*
+     * Deferred install of write_op[]/inline hooks:
+     *
+     * On 5.10/6.1 GKI, sel_write_access()/write_op[] are re-patched by the
+     * kernel after selinux_complete_init(), so installing them during the
+     * pre-kernel-init event is overwritten later. v1.1.4 deregistered this
+     * guard and the overwrite caused (a) before_sel_write_access never being
+     * called, and (b) corrupted pointers in the execve -> blk-mq path that
+     * eventually crashed inside __blk_mq_alloc_request (ESR=0x96000005 on a
+     * stale user VA). Restore the v1.1.0 behavior: only install write_op
+     * hooks after SELinux is actually ready, i.e. when this init() runs in a
+     * post-init event (boot-completed/post-kernel-init) *or* when triggered
+     * from after_selinux_complete_init()/after_selinux_policy_commit() once
+     * g_selinux_ready becomes true.
+     */
+    if (event_is_post_init(event) || READ_ONCE(g_selinux_ready)) {
+        rc = install_write_op_hooks();
+        if (rc) {
+            uninstall_inline_hooks();
+            return rc;
+        }
+    } else {
+        pr_info("[selinux_hook] deferring install_write_op_hooks until SELinux ready (event=%s)\n",
+                event ?: "(null)");
+        WRITE_ONCE(g_write_op_install_deferred, true);
     }
 
     /*
-     * Policydb redirect hooks / policydb 重定向 hooks：
+     * Policydb redirect hooks:
      * These helpers depend on newer/stateful SELinux ABI. 4.9 already uses the
      * lightweight legacy filters above, so skip these device-specific hooks there.
      */
@@ -4413,6 +4568,10 @@ static long exit_(void *__user r)
 {
     uninstall_write_op_hooks();
     uninstall_inline_hooks();
+
+    /* Clear any deferred install state so a later KPM re-init won't think a
+     * write_op install is still pending. */
+    WRITE_ONCE(g_write_op_install_deferred, false);
 
     if (READ_ONCE(g_clean_policydb_direct) && g_clean_policydb) {
         if (policydb_destroy_fn)
