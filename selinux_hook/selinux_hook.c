@@ -2764,7 +2764,7 @@ static bool event_is_post_init(const char *event)
 {
     if (!event)
         return false;
-    if (!strcmp(event, "pre-kernel-init"))
+    if (str_eq_lit(event, "pre-kernel-init"))
         return false;
     return true;
 }
