@@ -4,7 +4,7 @@
         "en": "For APatch hide dirty selinux rules",
         "zh": "隐藏脏的selinux规则"
     },
-    "modulename": "OverlayFS Meta Module",
+    "modulename": "APatch selinux_hook",
     "authors": ["APatch Modules Team"],
     "license": "GPL-2.0-only",
     "moduleid": "selinux_magisk_access_filter",
