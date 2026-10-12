@@ -10,5 +10,5 @@
     "moduleid": "selinux_magisk_access_filter",
     "version": "1.1.6.1",
     "VersionCode": 10000,
-    "downloadUrl": "http://cdn.admirecn.de/selinux_hook_1.1.6.1.kpm"
+    "downloadUrl": "https://repo.apatch.dev/m/selinux_magisk_access_filter/download.zip?kpm=1"
 }
